@@ -10,7 +10,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
     
-    const result = processReview({
+    const result = await processReview({
       vocabId,
       responseTimeMs,
       isCorrect,
@@ -34,7 +34,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'vocabId required' }, { status: 400 });
     }
     
-    const options = getChoiceOptions(vocabId, vocabType);
+    const options = await getChoiceOptions(vocabId, vocabType);
     return NextResponse.json({ options });
   } catch (error) {
     console.error('Choice options error:', error);

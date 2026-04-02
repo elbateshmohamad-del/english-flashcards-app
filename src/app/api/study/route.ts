@@ -3,8 +3,8 @@ import { initializeDatabase, getTodayStudyPlan } from '@/lib/db';
 
 export async function GET() {
   try {
-    initializeDatabase();
-    const plan = getTodayStudyPlan();
+    await initializeDatabase();
+    const plan = await getTodayStudyPlan();
     return NextResponse.json(plan);
   } catch (error) {
     console.error('Study plan error:', error);

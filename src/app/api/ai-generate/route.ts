@@ -6,7 +6,7 @@ export async function POST(request: NextRequest) {
   try {
     const { word, japanese } = await request.json();
     
-    const apiKey = getSetting('gemini_api_key');
+    const apiKey = await getSetting('gemini_api_key');
     if (!apiKey) {
       return NextResponse.json({ error: 'Gemini APIキーが設定されていません。設定画面からAPIキーを登録してください。' }, { status: 400 });
     }

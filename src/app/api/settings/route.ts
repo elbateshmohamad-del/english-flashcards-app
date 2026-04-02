@@ -10,7 +10,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'key required' }, { status: 400 });
     }
     
-    const value = getSetting(key);
+    const value = await getSetting(key);
     return NextResponse.json({ key, value });
   } catch (error) {
     console.error('Settings error:', error);
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'key and value required' }, { status: 400 });
     }
     
-    setSetting(key, value);
+    await setSetting(key, value);
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error('Settings error:', error);

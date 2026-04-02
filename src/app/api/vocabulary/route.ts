@@ -9,7 +9,7 @@ export async function GET(request: NextRequest) {
     const search = searchParams.get('search') || undefined;
     const type = searchParams.get('type') || undefined;
     
-    const result = getVocabularyList(page, limit, search, type);
+    const result = await getVocabularyList(page, limit, search, type);
     return NextResponse.json(result);
   } catch (error) {
     console.error('Vocabulary list error:', error);

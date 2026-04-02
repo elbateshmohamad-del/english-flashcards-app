@@ -1,16 +1,36 @@
-import Database from 'better-sqlite3';
+import { createClient, Client } from '@libsql/client';
 import path from 'path';
 import fs from 'fs';
 
-const DB_PATH = path.join(process.cwd(), 'data', 'flashcards.db');
+let _db: Client | null = null;
 
-function getDb(): Database.Database {
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  const db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
+export function getDb(): Client {
+  if (_db) return _db;
+
+  const url = process.env.TURSO_DATABASE_URL || 'file:' + path.join(process.cwd(), 'data', 'flashcards.db');
+  
+  if (url.startsWith('file:')) {
+    const dbPath = url.replace('file:', '');
+    const dir = path.dirname(dbPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  _db = createClient({
+    url,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+  
+  return _db;
+}
+
+export async function initializeDatabase() {
+  const db = getDb();
   
   // Create tables if they don't exist
-  db.exec(`
+  // executeMultiple is available in @libsql/client for multi-statement queries
+  await db.executeMultiple(`
     CREATE TABLE IF NOT EXISTS vocabulary (
       id INTEGER PRIMARY KEY,
       english TEXT NOT NULL,
@@ -53,31 +73,27 @@ function getDb(): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_review_log_date ON review_log(review_date);
   `);
   
-  return db;
-}
-
-export function initializeDatabase() {
-  const db = getDb();
-  
   // Check if vocabulary already loaded
-  const count = db.prepare('SELECT COUNT(*) as count FROM vocabulary').get() as { count: number };
+  const countRes = await db.execute('SELECT COUNT(*) as count FROM vocabulary');
+  const count = Number(countRes.rows[0].count);
   
-  if (count.count === 0) {
+  if (count === 0) {
     const vocabPath = path.join(process.cwd(), 'src', 'data', 'vocabulary.json');
-    const vocabData = JSON.parse(fs.readFileSync(vocabPath, 'utf-8'));
-    
-    const insert = db.prepare('INSERT OR IGNORE INTO vocabulary (id, english, japanese, type) VALUES (?, ?, ?, ?)');
-    const insertMany = db.transaction((items: Array<{ id: number; english: string; japanese: string; type: string }>) => {
-      for (const item of items) {
-        insert.run(item.id, item.english, item.japanese, item.type);
+    if (fs.existsSync(vocabPath)) {
+      const vocabData = JSON.parse(fs.readFileSync(vocabPath, 'utf-8'));
+      
+      const stmts = vocabData.map((item: any) => ({
+        sql: 'INSERT OR IGNORE INTO vocabulary (id, english, japanese, type) VALUES (?, ?, ?, ?)',
+        args: [item.id, item.english, item.japanese, item.type]
+      }));
+      
+      const chunkSize = 100;
+      for (let i = 0; i < stmts.length; i += chunkSize) {
+        await db.batch(stmts.slice(i, i + chunkSize), 'write');
       }
-    });
-    
-    insertMany(vocabData);
-    console.log(`Loaded ${vocabData.length} vocabulary items into database`);
+      console.log(`Loaded ${vocabData.length} vocabulary items into database`);
+    }
   }
-  
-  db.close();
 }
 
 // ===== Spaced Repetition System (SM-2 variant with time-based grading) =====
@@ -94,47 +110,53 @@ function calculateQuality(responseTimeMs: number, isCorrect: boolean, mode: stri
   else if (mode === 'ai') multiplier *= 2.5;
   else if (mode === 'choice') multiplier *= 1.5;
   
-  if (seconds <= 3 * multiplier) return 5;      // Perfect - instant recall
-  if (seconds <= 5 * multiplier) return 4;      // Good - fast
-  if (seconds <= 8 * multiplier) return 3;      // Hesitated
-  if (seconds <= 15 * multiplier) return 2;     // Struggled
-  return 1;                         // Very slow
+  if (seconds <= 3 * multiplier) return 5;
+  if (seconds <= 5 * multiplier) return 4;
+  if (seconds <= 8 * multiplier) return 3;
+  if (seconds <= 15 * multiplier) return 2;
+  return 1;
 }
 
-interface ReviewResult {
+export interface ReviewResult {
   vocabId: number;
   responseTimeMs: number;
   isCorrect: boolean;
   mode: string;
 }
 
-export function processReview(result: ReviewResult) {
+export async function processReview(result: ReviewResult) {
   const db = getDb();
   
-  const vocab = db.prepare('SELECT type FROM vocabulary WHERE id = ?').get(result.vocabId) as { type: string } | undefined;
-  const type = vocab?.type || 'word';
+  const vocabRes = await db.execute({
+    sql: 'SELECT type FROM vocabulary WHERE id = ?',
+    args: [result.vocabId]
+  });
+  const type = (vocabRes.rows[0]?.type as string) || 'word';
 
   const quality = calculateQuality(result.responseTimeMs, result.isCorrect, result.mode, type);
   
   // Get or create progress record
-  let progress = db.prepare('SELECT * FROM learning_progress WHERE vocab_id = ?').get(result.vocabId) as {
-    ease_factor: number;
-    interval_days: number;
-    repetitions: number;
-    total_reviews: number;
-    correct_count: number;
-  } | undefined;
+  const progressRes = await db.execute({
+    sql: 'SELECT * FROM learning_progress WHERE vocab_id = ?',
+    args: [result.vocabId]
+  });
+  
+  let progress = progressRes.rows[0] as any;
   
   if (!progress) {
-    db.prepare('INSERT INTO learning_progress (vocab_id) VALUES (?)').run(result.vocabId);
+    await db.execute({
+      sql: 'INSERT INTO learning_progress (vocab_id) VALUES (?)',
+      args: [result.vocabId]
+    });
     progress = { ease_factor: 2.5, interval_days: 0, repetitions: 0, total_reviews: 0, correct_count: 0 };
   }
   
-  let { ease_factor, interval_days, repetitions } = progress;
+  let ease_factor = Number(progress.ease_factor);
+  let interval_days = Number(progress.interval_days);
+  let repetitions = Number(progress.repetitions);
   
   // SM-2 Algorithm with modifications
   if (quality < 2) {
-    // Failed - reset
     repetitions = 0;
     interval_days = 1;
   } else {
@@ -148,122 +170,125 @@ export function processReview(result: ReviewResult) {
     repetitions += 1;
   }
   
-  // Update ease factor
   ease_factor = Math.max(1.3, ease_factor + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02)));
   
-  // Calculate next review date
   const nextDate = new Date();
   nextDate.setDate(nextDate.getDate() + interval_days);
   const nextDateStr = nextDate.toISOString().split('T')[0];
   
   const status = quality >= 4 ? 'mastered' : quality >= 2 ? 'learning' : 'new';
   
-  // Update progress
-  db.prepare(`
-    UPDATE learning_progress SET
-      ease_factor = ?,
-      interval_days = ?,
-      repetitions = ?,
-      next_review_date = ?,
-      last_review_date = date('now'),
-      last_response_time_ms = ?,
-      total_reviews = total_reviews + 1,
-      correct_count = correct_count + ?,
-      status = ?
-    WHERE vocab_id = ?
-  `).run(ease_factor, interval_days, repetitions, nextDateStr, result.responseTimeMs, result.isCorrect ? 1 : 0, status, result.vocabId);
+  await db.execute({
+    sql: `
+      UPDATE learning_progress SET
+        ease_factor = ?,
+        interval_days = ?,
+        repetitions = ?,
+        next_review_date = ?,
+        last_review_date = date('now'),
+        last_response_time_ms = ?,
+        total_reviews = total_reviews + 1,
+        correct_count = correct_count + ?,
+        status = ?
+      WHERE vocab_id = ?
+    `,
+    args: [ease_factor, interval_days, repetitions, nextDateStr, result.responseTimeMs, result.isCorrect ? 1 : 0, status, result.vocabId]
+  });
   
-  // Log the review
-  db.prepare(`
-    INSERT INTO review_log (vocab_id, response_time_ms, quality, mode)
-    VALUES (?, ?, ?, ?)
-  `).run(result.vocabId, result.responseTimeMs, quality, result.mode);
-  
-  db.close();
+  await db.execute({
+    sql: `
+      INSERT INTO review_log (vocab_id, response_time_ms, quality, mode)
+      VALUES (?, ?, ?, ?)
+    `,
+    args: [result.vocabId, result.responseTimeMs, quality, result.mode]
+  });
   
   return { quality, nextReviewDate: nextDateStr, intervalDays: interval_days };
 }
 
 // ===== Compound Learning Pace Control =====
 
-export function getTodayStudyPlan() {
+export async function getTodayStudyPlan() {
   const db = getDb();
   const today = new Date().toISOString().split('T')[0];
   
+  const [totalVocabRes, totalLearnedRes, totalMasteredRes, studiedTodayRes] = await db.batch([
+    'SELECT COUNT(*) as c FROM vocabulary',
+    "SELECT COUNT(*) as c FROM learning_progress WHERE status != 'new'",
+    "SELECT COUNT(*) as c FROM learning_progress WHERE status = 'mastered'",
+    "SELECT COUNT(DISTINCT vocab_id) as c FROM review_log WHERE date(review_date) = date('now')"
+  ], 'read');
   
-  // Get stats
-  const totalVocab = (db.prepare('SELECT COUNT(*) as c FROM vocabulary').get() as { c: number }).c;
-  const totalLearned = (db.prepare("SELECT COUNT(*) as c FROM learning_progress WHERE status != 'new'").get() as { c: number }).c;
-  const totalMastered = (db.prepare("SELECT COUNT(*) as c FROM learning_progress WHERE status = 'mastered'").get() as { c: number }).c;
-  const studiedToday = (db.prepare("SELECT COUNT(DISTINCT vocab_id) as c FROM review_log WHERE date(review_date) = date('now')").get() as { c: number }).c;
+  const totalVocab = Number(totalVocabRes.rows[0].c);
+  const totalLearned = Number(totalLearnedRes.rows[0].c);
+  const totalMastered = Number(totalMasteredRes.rows[0].c);
+  const studiedToday = Number(studiedTodayRes.rows[0].c);
   
-  // Get reviews due today
-  const reviewsDue = db.prepare(`
-    SELECT v.*, lp.next_review_date, lp.status, lp.repetitions, lp.interval_days, lp.ease_factor
-    FROM learning_progress lp
-    JOIN vocabulary v ON v.id = lp.vocab_id
-    WHERE lp.next_review_date <= ?
-    ORDER BY lp.next_review_date ASC
-  `).all(today);
+  const reviewsDueRes = await db.execute({
+    sql: `
+      SELECT v.*, lp.next_review_date, lp.status, lp.repetitions, lp.interval_days, lp.ease_factor
+      FROM learning_progress lp
+      JOIN vocabulary v ON v.id = lp.vocab_id
+      WHERE lp.next_review_date <= ?
+      ORDER BY lp.next_review_date ASC
+    `,
+    args: [today]
+  });
+  const reviewsDue = reviewsDueRes.rows;
   
-  // Get user baseline or default to 20
-  const settingStr = (db.prepare("SELECT value FROM settings WHERE key = 'new_words_per_day'").get() as { value: string } | undefined)?.value;
+  const settingRes = await db.execute("SELECT value FROM settings WHERE key = 'new_words_per_day'");
+  const settingStr = settingRes.rows.length > 0 ? (settingRes.rows[0].value as string) : undefined;
   const baseNewWords = settingStr ? parseInt(settingStr, 10) : 20;
 
-  // Compound learning: determine new words to introduce
-  const progressRatio = totalLearned / totalVocab;
+  const progressRatio = totalVocab > 0 ? totalLearned / totalVocab : 0;
   let newWordsToday: number;
   
   if (progressRatio < 0.1) {
-    // Phase 1: Slow start (~60% of base)
     newWordsToday = Math.floor(baseNewWords * 0.6);
   } else if (progressRatio < 0.3) {
-    // Phase 2: Building momentum (100% of base)
     newWordsToday = baseNewWords;
   } else if (progressRatio < 0.6) {
-    // Phase 3: Compound acceleration (150% of base)
     newWordsToday = Math.floor(baseNewWords * 1.5);
   } else {
-    // Phase 4: Sprint to finish (110% of base)
     newWordsToday = Math.floor(baseNewWords * 1.1);
   }
   
-  // Anti-burnout: Cap if reviews are too many
   const MAX_DAILY_REVIEWS = 100;
   if (reviewsDue.length > MAX_DAILY_REVIEWS) {
-    newWordsToday = 0; // Pause new words, focus on review
+    newWordsToday = 0; 
   } else if (reviewsDue.length > MAX_DAILY_REVIEWS * 0.7) {
     newWordsToday = Math.max(5, Math.floor(newWordsToday * 0.5));
   }
   
-  // Get new words (not yet in learning_progress)
-  const newWords = db.prepare(`
-    SELECT v.* FROM vocabulary v
-    LEFT JOIN learning_progress lp ON lp.vocab_id = v.id
-    WHERE lp.id IS NULL
-    ORDER BY v.id ASC
-    LIMIT ?
-  `).all(newWordsToday);
-  
-  db.close();
+  const newWordsRes = await db.execute({
+    sql: `
+      SELECT v.* FROM vocabulary v
+      LEFT JOIN learning_progress lp ON lp.vocab_id = v.id
+      WHERE lp.id IS NULL
+      ORDER BY v.id ASC
+      LIMIT ?
+    `,
+    args: [newWordsToday]
+  });
+  const newCards = newWordsRes.rows;
   
   return {
     reviewCards: reviewsDue,
-    newCards: newWords,
+    newCards: newCards,
     stats: {
       totalVocab,
       totalLearned,
       totalMastered,
       studiedToday,
       reviewsDueCount: reviewsDue.length,
-      newWordsToday: newWords.length,
-      progressPercent: Math.round((totalLearned / totalVocab) * 100),
-      masteredPercent: Math.round((totalMastered / totalVocab) * 100),
+      newWordsToday: newCards.length,
+      progressPercent: totalVocab > 0 ? Math.round((totalLearned / totalVocab) * 100) : 0,
+      masteredPercent: totalVocab > 0 ? Math.round((totalMastered / totalVocab) * 100) : 0,
     }
   };
 }
 
-export function getVocabularyList(page: number = 1, limit: number = 50, search?: string, type?: string) {
+export async function getVocabularyList(page: number = 1, limit: number = 50, search?: string, type?: string) {
   const db = getDb();
   
   let whereClause = 'WHERE 1=1';
@@ -278,16 +303,15 @@ export function getVocabularyList(page: number = 1, limit: number = 50, search?:
     countParams.push(type);
   }
   
-  // Count query
   const countQuery = `
     SELECT COUNT(*) as c
     FROM vocabulary v
     LEFT JOIN learning_progress lp ON lp.vocab_id = v.id
     ${whereClause}
   `;
-  const total = (db.prepare(countQuery).get(...countParams) as { c: number }).c;
+  const countRes = await db.execute({ sql: countQuery, args: countParams });
+  const total = Number(countRes.rows[0].c);
   
-  // Data query
   const dataQuery = `
     SELECT v.*, 
       COALESCE(lp.status, 'new') as learn_status,
@@ -301,38 +325,40 @@ export function getVocabularyList(page: number = 1, limit: number = 50, search?:
     ORDER BY v.id ASC LIMIT ? OFFSET ?
   `;
   const dataParams = [...countParams, limit, (page - 1) * limit];
-  const items = db.prepare(dataQuery).all(...dataParams);
+  const itemsRes = await db.execute({ sql: dataQuery, args: dataParams });
   
-  db.close();
-  
-  return { items, total, page, totalPages: Math.ceil(total / limit) };
+  return { items: itemsRes.rows, total, page, totalPages: Math.ceil(total / limit) };
 }
 
-export function getChoiceOptions(vocabId: number, vocabType: string) {
+export async function getChoiceOptions(vocabId: number, vocabType: string) {
   const db = getDb();
   
-  // Get 3 random wrong answers of the same type
-  const wrongOptions = db.prepare(`
-    SELECT english FROM vocabulary 
-    WHERE id != ? AND type = ?
-    ORDER BY RANDOM() 
-    LIMIT 3
-  `).all(vocabId, vocabType) as { english: string }[];
+  const wrongOptionsRes = await db.execute({
+    sql: `
+      SELECT english FROM vocabulary 
+      WHERE id != ? AND type = ?
+      ORDER BY RANDOM() 
+      LIMIT 3
+    `,
+    args: [vocabId, vocabType]
+  });
   
-  db.close();
-  
-  return wrongOptions.map(o => o.english);
+  return wrongOptionsRes.rows.map((o: any) => o.english as string);
 }
 
-export function getSetting(key: string): string | null {
+export async function getSetting(key: string): Promise<string | null> {
   const db = getDb();
-  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
-  db.close();
-  return row?.value ?? null;
+  const res = await db.execute({
+    sql: 'SELECT value FROM settings WHERE key = ?',
+    args: [key]
+  });
+  return res.rows.length > 0 ? (res.rows[0].value as string) : null;
 }
 
-export function setSetting(key: string, value: string) {
+export async function setSetting(key: string, value: string) {
   const db = getDb();
-  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value);
-  db.close();
+  await db.execute({
+    sql: 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+    args: [key, value]
+  });
 }
